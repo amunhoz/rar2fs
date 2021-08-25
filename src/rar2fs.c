@@ -25,6 +25,7 @@
     the documentation and source comments that the code may not be used
     to develop a RAR (WinRAR) compatible archiver.
 */
+
 #include <platform.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -41,6 +42,7 @@
 #include <getopt.h>
 #include <syslog.h>
 #include <wchar.h>
+#include <stdlib.h> //customized
 #ifdef HAVE_LOCALE_H
 # include <locale.h>
 #endif
@@ -472,6 +474,9 @@ static char *get_password(const char *file, char *buf, size_t len)
         char *s;
         const prop_alloc_type_ *password;
 
+       
+        
+
         if (!file)
                 return NULL;
 
@@ -492,7 +497,7 @@ static char *get_password(const char *file, char *buf, size_t len)
                                 RAR_PASSWORD_PROP);
         if (password) {
                 prop_memcpy_(buf, password, len);
-                free(tmp);
+                free(tmp);                               
                 return buf;
         }
         free(tmp);
@@ -515,6 +520,18 @@ static char *get_password(const char *file, char *buf, size_t len)
                 l[1] = lx - 4;
                 f[1] = strdup(file);
         }
+
+       
+        //customized        
+        //************************************************ 
+        char *passvar;
+        passvar = getenv("RAR2FS_KEY");
+        if (passvar){            
+                int len = strlen(passvar)+1;                                    
+                mbstowcs(buf,passvar,len);                
+                return buf;            
+        }
+        //************************************************ 
         for (i = 0; i < 2; i++) {
                 if (f[i]) {
                         char *F = f[i];
@@ -544,7 +561,7 @@ static char *get_password(const char *file, char *buf, size_t len)
 #endif
                                 fclose(fp);
                                 free(f[0]);
-                                free(f[1]);
+                                free(f[1]);                                                                   
                                 return buf;
                         }
                 }
@@ -886,10 +903,6 @@ static int get_vformat(const char *s, int t, int *l, int *p)
                 }
         }
 
-        /* Sanity check */
-        if (len <= 0 || pos < 0 || (size_t)(len + pos) > SLEN)
-                return -1;
-
         if (l) *l = len;
         if (p) *p = pos;
         return vol;
@@ -911,8 +924,6 @@ static int __RARVolNameToFirstName(char *arch, int vtype)
         int ret = 0;
 
         vol = get_vformat(arch, !vtype, &len, &pos);
-        if (vol == -1)
-                return -1;
         RARVolNameToFirstName(arch, vtype);
 
         memset(&header, 0, sizeof(header));
@@ -1754,15 +1765,20 @@ out:
  * Identifies all the files that are part of the same multipart archive and
  * located in the same directory as |arch| and stores their paths.
  *
- * Returns 0 on success.
- * Returns a negative ERAR_ error code in case of error.
+ * Returns the number of files making the multipart archive.
+ * Returns 1 if |arch| is not part of a multipart archive.
+ * Returns a negative ERAR error code in case of error.
  ****************************************************************************/
 static int collect_files(const char *arch)
 {
         RAROpenArchiveDataEx d;
-        struct RARHeaderDataEx header;
+        int files;
         char *arch_;
+        int format;
         struct dir_entry_list *list;
+        int vol = -1;
+        int pos;
+        int len;
 
         memset(&d, 0, sizeof(RAROpenArchiveDataEx));
         d.ArcName = (char *)arch;   /* Horrible cast! But hey... it is the API! */
@@ -1775,6 +1791,7 @@ static int collect_files(const char *arch)
         if (!arch_)
                 return -ERAR_NO_MEMORY;
 
+again:
         h = RAROpenArchiveEx(&d);
 
         /* Check for fault */
@@ -1785,47 +1802,41 @@ static int collect_files(const char *arch)
                 return -d.OpenResult;
         }
 
-        if (d.Flags & ROADF_VOLUME) {
-                int format = IS_NNN(arch_) ? 1 : VTYPE(d.Flags);
-                if (__RARVolNameToFirstName(arch_, !format)) {
+        format = IS_NNN(arch) ? 1 : VTYPE(d.Flags);
+        if (vol == -1)
+                vol = get_vformat(arch, format, &len, &pos);
+        if (d.Flags & ROADF_VOLUME && !(d.Flags & ROADF_FIRSTVOLUME)) {
+                if (vol) {
+                        char *tmp;
+                        RARCloseArchive(h);
+                        --vol;
+                        tmp = get_vname(format, arch_, vol, len, pos);
                         free(arch_);
-                        return -ERAR_EOPEN;
-                }
-                RARCloseArchive(h);
-                d.ArcName = (char *)arch_;
-                h = RAROpenArchiveEx(&d);
-
-                /* Check for fault */
-                if (d.OpenResult != ERAR_SUCCESS) {
-                        if (h)
-                                RARCloseArchive(h);
-                        free(arch_);
-                        return -d.OpenResult;
+                        arch_ = tmp;
+                        d.ArcName = (char *)arch_;
+                        goto again;
                 }
         }
 
         RARArchiveDataEx *arc = NULL;
         int dll_result = RARListArchiveEx(h, &arc);
-        if (dll_result != ERAR_SUCCESS) {
-                if (dll_result == ERAR_EOPEN && arc)
-                        dll_result = ERAR_SUCCESS;
-                if (dll_result == ERAR_END_ARCHIVE && !arc)
-                        dll_result = ERAR_EOPEN;
-        }
-        if (dll_result != ERAR_SUCCESS && dll_result != ERAR_END_ARCHIVE) {
-                RARFreeArchiveDataEx(&arc);
-                RARCloseArchive(h);
-                free(arch_);
-                return -dll_result;
+        if (dll_result && dll_result != ERAR_EOPEN) {
+                if (dll_result != ERAR_END_ARCHIVE) {
+                        RARFreeArchiveDataEx(&arc);
+                        RARCloseArchive(h);
+                        free(arch_);
+                        return -dll_result;
+                }
         }
 
         /* Pointless to test for encrypted files if header is already encrypted
          * and could be read. */
         if (d.Flags & ROADF_ENCHEADERS)
                 goto skip_file_check;
+
         if (arc->hdr.Flags & RHDF_ENCRYPTED) {
                 dll_result = extract_rar(arch_, arc->hdr.FileName, NULL);
-                if (dll_result != ERAR_SUCCESS && dll_result != ERAR_UNKNOWN) {
+                if (dll_result && dll_result != ERAR_UNKNOWN) {
                         RARFreeArchiveDataEx(&arc);
                         RARCloseArchive(h);
                         free(arch_);
@@ -1835,47 +1846,37 @@ static int collect_files(const char *arch)
 
 skip_file_check:
         RARFreeArchiveDataEx(&arc);
-        RARCloseArchive(h);
-
         list = arch_list;
         dir_list_open(list);
 
-        /* Let libunrar deal with the collection of volume parts */
+        files = 0;
         if (d.Flags & ROADF_VOLUME) {
-                h = RAROpenArchiveEx(&d);
-
-                /* Check for fault */
-                if (d.OpenResult != ERAR_SUCCESS) {
-                        if (h)
-                                RARCloseArchive(h);
-                        free(arch_);
-                        return -d.OpenResult;
-                }
+                off_t prev_size = 0;
                 while (1) {
-                        dll_result = RARReadHeaderEx(h, &header);
-                        if (dll_result != ERAR_SUCCESS) {
-                                if (dll_result == ERAR_END_ARCHIVE)
-                                        dll_result = ERAR_SUCCESS;
-                                else
-                                        dll_result = ERAR_EOPEN;
+                        struct stat st;
+                        if (stat(arch_, &st))
                                 break;
-                        }
-                        (void)RARProcessFile(h, RAR_SKIP, NULL, NULL);
-                        list = dir_entry_add(list, header.ArcName, NULL,
-                                             DIR_E_NRM);
+                        if (files && st.st_size != prev_size)
+                                if (is_first_volume_by_name(arch_))
+                                        break;
+                        prev_size = st.st_size;
+                        list = dir_entry_add(list, arch_, NULL,
+                                                DIR_E_NRM);
+                        ++files;
+                        RARNextVolumeName(arch_, !format);
                 }
-                RARCloseArchive(h);
         } else {
                 (void)dir_entry_add(list, arch_, NULL, DIR_E_NRM);
-                dll_result = ERAR_SUCCESS;
+                files = 1;
         }
 
-        if (dll_result != ERAR_SUCCESS)
-                dir_list_free(arch_list);
+        RARCloseArchive(h);
         free(arch_);
+        if (!files)
+                dir_list_free(arch_list);
 
         /* Do not close the list since it could re-order the entries! */
-        return -dll_result;
+        return files;
 }
 
 /*!
@@ -2654,6 +2655,7 @@ static int listrar(const char *path, struct dir_entry_list **buffer,
                 const char *arch, char **first_arch, int *final)
 {
         ENTER_("%s   arch=%s", path, arch);
+
         RAROpenArchiveDataEx d;
         memset(&d, 0, sizeof(RAROpenArchiveDataEx));
         d.ArcName = (char *)arch;   /* Horrible cast! But hey... it is the API! */
@@ -5748,7 +5750,13 @@ int main(int argc, char *argv[])
                                src_path_full, error_to_string(err));
                         return err;
                 }
+                if (ret == 0) {
+                        printf("%s: cannot find primary file for multipart archive '%s'\n",
+                               argv[0], src_path_full);
+                        return 1;
+                }
         }
+
 
         /* Check I/O buffer and history size */
         if (check_iob(argv[0], 1))
